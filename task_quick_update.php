@@ -36,18 +36,34 @@ try {
         exit;
     }
 
+    $pdo = get_pdo();
+
+    $beforeStmt = $pdo->prepare('SELECT id, title, assigned_to, status, priority, due_date, created_by FROM tasks WHERE id = ?');
+    $beforeStmt->execute([$id]);
+    $before = $beforeStmt->fetch(PDO::FETCH_ASSOC);
+    if (!$before) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => 'Task not found']);
+        exit;
+    }
+
     // Gather fields to update (partial updates allowed)
-    $set   = [];
-    $bind  = [':id' => $id];
+    $set     = [];
+    $bind    = [':id' => $id];
+    $changedFields = [];
 
     // Assigned to (allow null/empty clears the field)
     if (array_key_exists('assigned_to', $_POST)) {
         $assigned = trim((string)($_POST['assigned_to'] ?? ''));
+        $beforeAssigned = trim((string)($before['assigned_to'] ?? ''));
         if ($assigned === '') {
             $set[] = 'assigned_to = NULL';
         } else {
             $set[] = 'assigned_to = :assigned_to';
             $bind[':assigned_to'] = $assigned;
+        }
+        if ($assigned !== $beforeAssigned) {
+            $changedFields[] = 'assigned_to';
         }
     }
 
@@ -62,6 +78,9 @@ try {
         }
         $set[] = 'status = :status';
         $bind[':status'] = $status;
+        if ($status !== (string)($before['status'] ?? '')) {
+            $changedFields[] = 'status';
+        }
     }
 
     // Priority
@@ -75,22 +94,14 @@ try {
         }
         $set[] = 'priority = :priority';
         $bind[':priority'] = $priority;
+        if ($priority !== (string)($before['priority'] ?? '')) {
+            $changedFields[] = 'priority';
+        }
     }
 
     if (empty($set)) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Nothing to update']);
-        exit;
-    }
-
-    $pdo = get_pdo();
-
-    // Ensure task exists
-    $chk = $pdo->prepare('SELECT id FROM tasks WHERE id = ?');
-    $chk->execute([$id]);
-    if (!$chk->fetchColumn()) {
-        http_response_code(404);
-        echo json_encode(['ok' => false, 'error' => 'Task not found']);
         exit;
     }
 
@@ -101,7 +112,7 @@ try {
     $st->execute($bind);
 
     // Fetch fresh values for response
-    $st2 = $pdo->prepare('SELECT id, assigned_to, status, priority FROM tasks WHERE id = ?');
+    $st2 = $pdo->prepare('SELECT id, title, assigned_to, status, priority, due_date, created_by FROM tasks WHERE id = ?');
     $st2->execute([$id]);
     $row = $st2->fetch(PDO::FETCH_ASSOC);
 
@@ -132,14 +143,18 @@ try {
     ];
 
     // Activity log (include which fields were updated)
-    $changedFields = [];
-    if (array_key_exists('assigned_to', $_POST)) $changedFields[] = 'assigned_to';
-    if (array_key_exists('status', $_POST))      $changedFields[] = 'status';
-    if (array_key_exists('priority', $_POST))    $changedFields[] = 'priority';
     try {
         log_event('task.quick_update', 'task', $id, ['changed' => $changedFields]);
     } catch (Throwable $e) {
         // non-fatal if logging fails
+    }
+
+    if ($changedFields) {
+        try {
+            task_notify_changes($id, $before, $row, array_values(array_unique($changedFields)), ['source' => 'quick']);
+        } catch (Throwable $notifyErr) {
+            error_log('task_quick_update notify failed: ' . $notifyErr->getMessage());
+        }
     }
 
     echo json_encode($resp);
