@@ -186,6 +186,16 @@ if (is_post()) {
                 $taskId = insert_task($data);
                 log_event('task.create', 'task', $taskId);
 
+                try {
+                    $creatorId  = isset($data['created_by']) ? (int)$data['created_by'] : null;
+                    $assigneeId = resolve_notification_user_id($data['assigned_to'] ?? null);
+                    if ($creatorId || $assigneeId) {
+                        task_subscribe_participants($taskId, $creatorId, $assigneeId);
+                    }
+                } catch (Throwable $notifyErr) {
+                    error_log('task_new notification bootstrap failed: ' . $notifyErr->getMessage());
+                }
+
                 // 2) Try to save each photo (best-effort; don’t fail the whole request)
                 for ($i = 1; $i <= 3; $i++) {
                     try {

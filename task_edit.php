@@ -12,6 +12,8 @@ if (!$task) {
     redirect_with_message('tasks.php', 'Task not found.', 'error');
 }
 
+$originalTask = $task;
+
 $errors    = [];
 $photos    = fetch_task_photos($taskId); // [1]..[3]
 $photoCnt  = 0;
@@ -45,6 +47,51 @@ if (is_post()) {
         } else {
             update_task($taskId, $data);
             log_event('task.update', 'task', $taskId);
+            $changedForNotify = [];
+            if (array_key_exists('assigned_to', $data)) {
+                $beforeAssigned = trim((string)($task['assigned_to'] ?? ''));
+                $afterAssigned  = trim((string)($data['assigned_to'] ?? ''));
+                if ($beforeAssigned !== $afterAssigned) {
+                    $changedForNotify[] = 'assigned_to';
+                }
+            }
+            if (array_key_exists('status', $data)) {
+                $beforeStatus = (string)($task['status'] ?? '');
+                $afterStatus  = (string)($data['status'] ?? '');
+                if ($beforeStatus !== $afterStatus) {
+                    $changedForNotify[] = 'status';
+                }
+            }
+            if (array_key_exists('priority', $data)) {
+                $beforePriority = (string)($task['priority'] ?? '');
+                $afterPriority  = (string)($data['priority'] ?? '');
+                if ($beforePriority !== $afterPriority) {
+                    $changedForNotify[] = 'priority';
+                }
+            }
+            if (array_key_exists('due_date', $data)) {
+                $beforeDue = $task['due_date'] ? (string)$task['due_date'] : '';
+                $afterDue  = trim((string)($data['due_date'] ?? ''));
+                if ($beforeDue !== $afterDue) {
+                    $changedForNotify[] = 'due_date';
+                }
+            }
+            if (array_key_exists('title', $data)) {
+                $beforeTitle = trim((string)($task['title'] ?? ''));
+                $afterTitle  = trim((string)($data['title'] ?? ''));
+                if ($beforeTitle !== $afterTitle) {
+                    $changedForNotify[] = 'title';
+                }
+            }
+
+            if ($changedForNotify) {
+                try {
+                    $updatedTask = fetch_task($taskId) ?: array_merge($task, $data);
+                    task_notify_changes($taskId, $originalTask, $updatedTask, array_values(array_unique($changedForNotify)));
+                } catch (Throwable $notifyErr) {
+                    error_log('task_edit notify failed: ' . $notifyErr->getMessage());
+                }
+            }
             redirect_with_message('task_view.php?id=' . $taskId, 'Task updated successfully.');
         }
         if ($data['building_id']) {
