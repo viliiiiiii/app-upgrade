@@ -22,7 +22,7 @@ try {
             $limit  = max(1, min(100, (int)($_GET['limit'] ?? 20)));
             $offset = max(0, (int)($_GET['offset'] ?? 0));
             $rows = notif_list($userId, $limit, $offset);
-            echo json_encode(['ok'=>true,'items'=>$rows]);
+            echo json_encode(['ok'=>true,'items'=>$rows,'unread'=>notif_unread_count($userId)]);
             break;
 
         case 'mark_read':
@@ -31,7 +31,8 @@ try {
             }
             $id = (int)($_POST['id'] ?? 0);
             if ($id) notif_mark_read($userId, $id);
-            echo json_encode(['ok'=>true]);
+            $count = notif_unread_count($userId);
+            echo json_encode(['ok'=>true,'count'=>$count]);
             break;
 
         case 'mark_all_read':
@@ -39,7 +40,8 @@ try {
                 http_response_code(422); echo json_encode(['ok'=>false,'error'=>'csrf']); break;
             }
             notif_mark_all_read($userId);
-            echo json_encode(['ok'=>true]);
+            $count = notif_unread_count($userId);
+            echo json_encode(['ok'=>true,'count'=>$count]);
             break;
 
         default:
