@@ -728,8 +728,8 @@ function require_root(): void {
   }
 }
 function notify_users(array $userIds, string $type, string $title, string $body, ?string $link = null, array $payload = []): void {
-    $ids = array_values(array_unique(array_filter(array_map('intval', $userIds))));
-    if (!$ids) {
+    $rawIds = array_values(array_filter(array_map('intval', $userIds)));
+    if (!$rawIds) {
         return;
     }
 
@@ -740,6 +740,104 @@ function notify_users(array $userIds, string $type, string $title, string $body,
     try { $actor = current_user(); } catch (Throwable $e) {}
     $actorId = isset($actor['id']) ? (int)$actor['id'] : null;
 
+    try {
+        require_once __DIR__ . '/includes/notifications.php';
+    } catch (Throwable $bootstrapErr) {
+        $bootstrapErr = $bootstrapErr; // make sure variable is defined for fallback path
+    }
+
+    $actorLocalId = null;
+    $ids = [];
+
+    $inlineMap = function (int $id) use (&$inlineMap) {
+        if ($id <= 0) {
+            return null;
+        }
+
+        static $cache = [];
+        if (array_key_exists($id, $cache)) {
+            return $cache[$id];
+        }
+
+        try {
+            $pdo = get_pdo();
+            $st  = $pdo->prepare('SELECT id FROM users WHERE id = :id LIMIT 1');
+            $st->execute([':id' => $id]);
+            $row = $st->fetch(PDO::FETCH_ASSOC);
+            if ($row && isset($row['id'])) {
+                return $cache[$id] = (int)$row['id'];
+            }
+        } catch (Throwable $e) {
+            // keep probing via CORE email lookup below
+        }
+
+        $email = null;
+        $role  = null;
+        try {
+            if (function_exists('core_user_record')) {
+                $core = core_user_record($id);
+                if ($core) {
+                    $email = $core['email'] ?? null;
+                    $role  = $core['role_key'] ?? ($core['role'] ?? null);
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        if (!$email) {
+            return $cache[$id] = null;
+        }
+
+        try {
+            $pdo = get_pdo();
+            $st  = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+            $st->execute([':email' => $email]);
+            $row = $st->fetch(PDO::FETCH_ASSOC);
+            if ($row && isset($row['id'])) {
+                return $cache[$id] = (int)$row['id'];
+            }
+
+            $roleKey = is_string($role) ? strtolower($role) : '';
+            $localRole = in_array($roleKey, ['admin', 'manager', 'root'], true) ? 'admin' : 'user';
+            $password = password_hash(bin2hex(random_bytes(18)), PASSWORD_BCRYPT);
+            $ins = $pdo->prepare('INSERT INTO users (email, password_hash, role, created_at) VALUES (:email, :hash, :role, NOW())');
+            $ins->execute([
+                ':email' => $email,
+                ':hash'  => $password,
+                ':role'  => $localRole,
+            ]);
+            return $cache[$id] = (int)$pdo->lastInsertId();
+        } catch (Throwable $e) {
+            try { error_log('notify_users local user map failed for ' . $id . ': ' . $e->getMessage()); } catch (Throwable $_) {}
+        }
+
+        return $cache[$id] = null;
+    };
+
+    if (function_exists('notif_resolve_local_user_ids')) {
+        $ids = notif_resolve_local_user_ids($rawIds);
+        if ($actorId) {
+            $actorLocalId = notif_resolve_local_user_id($actorId);
+        }
+    } else {
+        foreach ($rawIds as $uid) {
+            $mapped = $inlineMap($uid);
+            if ($mapped) {
+                $ids[] = $mapped;
+            }
+        }
+        if ($actorId) {
+            $actorLocalId = $inlineMap($actorId);
+        }
+        $ids = array_values(array_unique($ids));
+    }
+
+    if (!$ids) {
+        // No resolvable recipients -> nothing to do.
+        return;
+    }
+
     $basePayload = [
         'type'    => $type,
         'title'   => $title,
@@ -747,21 +845,27 @@ function notify_users(array $userIds, string $type, string $title, string $body,
         'url'     => $link,
         'data'    => $payload,
     ];
-    if ($actorId) {
-        $basePayload['actor_user_id'] = $actorId;
+    if ($actorLocalId) {
+        $basePayload['actor_user_id'] = $actorLocalId;
+    }
+    if ($actorId && $actorLocalId !== $actorId) {
+        $basePayload['data'] = ($basePayload['data'] ?? []) + ['actor_core_user_id' => $actorId];
     }
 
     try {
-        require_once __DIR__ . '/includes/notifications.php';
-        notif_broadcast($ids, $basePayload);
-        return;
+        if (function_exists('notif_broadcast')) {
+            notif_broadcast($ids, $basePayload);
+            return;
+        }
+        throw new RuntimeException('notif_broadcast unavailable');
     } catch (Throwable $e) {
         // Fall back to a direct insert so callers still get something even if the
         // notification helpers are unavailable for some reason.
         try {
             $pdo  = get_pdo();
             $now  = date('Y-m-d H:i:s');
-            $json = $payload ? json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
+            $jsonPayload = $basePayload['data'] ?? null;
+            $json = $jsonPayload ? json_encode($jsonPayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
             $sql  = "INSERT INTO notifications (user_id, type, title, body, url, data, actor_user_id, created_at)
                      VALUES (:user_id, :type, :title, :body, :url, :data, :actor_user_id, :created_at)";
             $stmt = $pdo->prepare($sql);
@@ -774,7 +878,7 @@ function notify_users(array $userIds, string $type, string $title, string $body,
                     ':body'          => $body,
                     ':url'           => $link,
                     ':data'          => $json,
-                    ':actor_user_id' => $actorId,
+                    ':actor_user_id' => $actorLocalId,
                     ':created_at'    => $now,
                 ]);
             }
@@ -824,11 +928,14 @@ function task_subscribe_participants(int $taskId, ?int $creatorId, ?int $assigne
     }
 
     try {
-        if ($creatorId) {
-            notif_subscribe_user($creatorId, 'task', $taskId, 'task.updated', 'web');
+        $creatorLocalId   = $creatorId ? notif_resolve_local_user_id($creatorId) : null;
+        $assignedLocalId  = $assignedUserId ? notif_resolve_local_user_id($assignedUserId) : null;
+
+        if ($creatorLocalId) {
+            notif_subscribe_user($creatorLocalId, 'task', $taskId, 'task.updated', 'web');
         }
-        if ($assignedUserId) {
-            notif_subscribe_user($assignedUserId, 'task', $taskId, 'task.updated', 'web');
+        if ($assignedLocalId) {
+            notif_subscribe_user($assignedLocalId, 'task', $taskId, 'task.updated', 'web');
         }
     } catch (Throwable $e) {
         try { error_log('task_subscribe_participants failed: ' . $e->getMessage()); } catch (Throwable $_) {}
@@ -881,10 +988,15 @@ function task_notify_changes(int $taskId, array $before, array $after, array $ch
     $assignedAfterId  = resolve_notification_user_id($after['assigned_to'] ?? null);
     $creatorId        = isset($after['created_by']) ? (int)$after['created_by'] : (isset($before['created_by']) ? (int)$before['created_by'] : null);
 
+    $assignedBeforeLocalId = $assignedBeforeId ? notif_resolve_local_user_id($assignedBeforeId) : null;
+    $assignedAfterLocalId  = $assignedAfterId ? notif_resolve_local_user_id($assignedAfterId) : null;
+    $creatorLocalId        = $creatorId ? notif_resolve_local_user_id($creatorId) : null;
+    $actorLocalId          = $actorId ? notif_resolve_local_user_id($actorId) : null;
+
     // Keep creator and assignee subscribed for future updates.
     task_subscribe_participants($taskId, $creatorId, $assignedAfterId);
-    if ($assignedBeforeId && $assignedBeforeId !== $assignedAfterId) {
-        try { notif_unsubscribe_user($assignedBeforeId, 'task', $taskId, 'task.updated'); } catch (Throwable $_) {}
+    if ($assignedBeforeLocalId && $assignedBeforeLocalId !== $assignedAfterLocalId) {
+        try { notif_unsubscribe_user($assignedBeforeLocalId, 'task', $taskId, 'task.updated'); } catch (Throwable $_) {}
     }
 
     $payload = task_notification_payload($after + ['id' => $taskId], [
@@ -946,14 +1058,14 @@ function task_notify_changes(int $taskId, array $before, array $after, array $ch
         $subscribers = [];
     }
 
-    if ($creatorId && !in_array($creatorId, $subscribers, true)) {
-        $subscribers[] = $creatorId;
+    if ($creatorLocalId && !in_array($creatorLocalId, $subscribers, true)) {
+        $subscribers[] = $creatorLocalId;
     }
-    if ($assignedAfterId && !in_array($assignedAfterId, $subscribers, true)) {
-        $subscribers[] = $assignedAfterId;
+    if ($assignedAfterLocalId && !in_array($assignedAfterLocalId, $subscribers, true)) {
+        $subscribers[] = $assignedAfterLocalId;
     }
 
-    $audience = array_values(array_filter(array_unique(array_diff($subscribers, [$actorId]))));
+    $audience = array_values(array_filter(array_unique(array_diff($subscribers, $actorLocalId ? [$actorLocalId] : []))));
     if ($audience) {
         $headline = $title . ' updated';
         if ($actorEmail) {
