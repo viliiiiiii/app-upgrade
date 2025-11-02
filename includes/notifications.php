@@ -7,6 +7,106 @@ function notif_pdo(): PDO {
     return get_pdo();
 }
 
+/**
+ * Ensure we have a corresponding user record in the application database for
+ * the given identifier (either an existing local id or a CORE id).
+ *
+ * The notifications tables enforce a foreign-key to the local `users` table,
+ * so any id that originates from the CORE directory needs to be translated to
+ * its local counterpart.  We reuse existing rows when the ids already match or
+ * when we can find a row with the same email address.  As a last resort a
+ * placeholder user is provisioned so notifications can still be persisted.
+ */
+function notif_resolve_local_user_id(?int $userId): ?int {
+    $userId = (int)$userId;
+    if ($userId <= 0) {
+        return null;
+    }
+
+    static $cache = [];
+    if (array_key_exists($userId, $cache)) {
+        return $cache[$userId];
+    }
+
+    $appsPdo = notif_pdo();
+
+    // Fast path: the identifier is already a local user id.
+    try {
+        $st = $appsPdo->prepare('SELECT id FROM users WHERE id = :id LIMIT 1');
+        $st->execute([':id' => $userId]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if ($row && isset($row['id'])) {
+            return $cache[$userId] = (int)$row['id'];
+        }
+    } catch (Throwable $e) {
+        // If the lookup fails we keep probing using the CORE record.
+    }
+
+    // Fallback: resolve via CORE directory and match on email.
+    $coreEmail = null;
+    $coreRole  = null;
+    try {
+        if (function_exists('core_user_record')) {
+            $core = core_user_record($userId);
+            if ($core) {
+                $coreEmail = $core['email'] ?? null;
+                $coreRole  = $core['role_key'] ?? ($core['role'] ?? null);
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore and continue to the provisioning path below
+    }
+
+    if (!$coreEmail) {
+        return $cache[$userId] = null;
+    }
+
+    try {
+        $st = $appsPdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+        $st->execute([':email' => $coreEmail]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if ($row && isset($row['id'])) {
+            return $cache[$userId] = (int)$row['id'];
+        }
+
+        // No local row with that email yet – provision a shadow account so the
+        // notification rows can satisfy their foreign key.
+        $role = 'user';
+        $roleKey = is_string($coreRole) ? strtolower($coreRole) : '';
+        if (in_array($roleKey, ['admin', 'manager', 'root'], true)) {
+            $role = 'admin';
+        }
+
+        $password = password_hash(bin2hex(random_bytes(18)), PASSWORD_BCRYPT);
+        $ins = $appsPdo->prepare('INSERT INTO users (email, password_hash, role, created_at) VALUES (:email, :hash, :role, NOW())');
+        $ins->execute([
+            ':email' => $coreEmail,
+            ':hash'  => $password,
+            ':role'  => $role,
+        ]);
+
+        return $cache[$userId] = (int)$appsPdo->lastInsertId();
+    } catch (Throwable $e) {
+        try {
+            error_log('notif_resolve_local_user_id failed for ' . $userId . ': ' . $e->getMessage());
+        } catch (Throwable $_) {}
+    }
+
+    return $cache[$userId] = null;
+}
+
+/** Map a list of user identifiers (CORE or local) to local ids. */
+function notif_resolve_local_user_ids(array $userIds): array {
+    $out = [];
+    foreach ($userIds as $uid) {
+        $local = notif_resolve_local_user_id((int)$uid);
+        if ($local) {
+            $out[] = $local;
+        }
+    }
+    return array_values(array_unique($out));
+}
+
 /** Upsert per-type preference (web/email/push + mute) */
 function notif_set_type_pref(int $userId, string $type, array $prefs): void {
     $pdo = notif_pdo();
@@ -27,14 +127,22 @@ function notif_set_type_pref(int $userId, string $type, array $prefs): void {
 
 /** Get effective channel permissions for user+type (defaults if no row). */
 function notif_get_type_pref(int $userId, string $type): array {
+    static $cache = [];
+    $key = $userId . '|' . $type;
+    if (isset($cache[$key])) {
+        return $cache[$key];
+    }
+
     $pdo = notif_pdo();
     $stmt = $pdo->prepare("SELECT allow_web, allow_email, allow_push, mute_until
                            FROM notification_type_prefs
                            WHERE user_id=:u AND notif_type=:t");
     $stmt->execute([':u'=>$userId, ':t'=>$type]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$row) return ['allow_web'=>1,'allow_email'=>0,'allow_push'=>0,'mute_until'=>null];
-    return $row;
+    if (!$row) {
+        return $cache[$key] = ['allow_web'=>1,'allow_email'=>0,'allow_push'=>0,'mute_until'=>null];
+    }
+    return $cache[$key] = $row;
 }
 
 /** Subscribe a user to events for an entity (e.g. note.comment on note #123). */
